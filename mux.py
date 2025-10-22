@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Downmix Remuxer — selectable scan list + ETA (elapsed-time based)
-ETA now uses: elapsed_time_so_far / overall_progress_fraction * (1 - overall_progress_fraction)
-so it updates immediately from the observed runtime and current progress percentage.
+Downmix Remuxer — full, fixed script
+- Recursive scan option
+- Selectable checklist, Select All / Deselect All
+- Refresh durations
+- Per-file progress from ffmpeg and mkvmerge (size-polled)
+- Overall progress and ETA computed from elapsed time + progress fraction
+- Robust executable detection with common Windows fallbacks
 Requirements:
 - Python 3.7+
-- ffmpeg, ffprobe, mkvmerge in PATH or set COMMON_FALLBACKS
+- ffmpeg, ffprobe, mkvmerge in PATH or configured in COMMON_FALLBACKS
 """
 import os
 import json
@@ -16,6 +20,7 @@ import time
 import re
 from pathlib import Path
 from queue import Queue, Empty
+from typing import Callable
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 
@@ -26,6 +31,7 @@ LOG_FILE = "stereo_injector_errors.log"
 CONFIG_FILE = "stereo_injector_config.json"
 DEFAULT_THREADS = max(1, os.cpu_count() or 4)
 
+# Edit fallbacks to point to your local installations if needed
 COMMON_FALLBACKS = {
     "ffmpeg": [
         r"C:\ffmpeg\bin\ffmpeg.exe",
@@ -44,7 +50,7 @@ COMMON_FALLBACKS = {
 }
 
 # ---------- UTILITIES ----------
-def log_error(message):
+def log_error(message: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -56,7 +62,8 @@ def load_config():
     defaults = {
         "delete_original_after_mux": False,
         "ffmpeg_threads": DEFAULT_THREADS,
-        "stereo_bitrate": DEFAULT_STEREO_BITRATE
+        "stereo_bitrate": DEFAULT_STEREO_BITRATE,
+        "scan_subfolders": True
     }
     try:
         p = Path(CONFIG_FILE)
@@ -69,7 +76,7 @@ def load_config():
         log_error(f"[Config Load] {e}")
     return defaults.copy()
 
-def save_config(cfg):
+def save_config(cfg: dict):
     try:
         Path(CONFIG_FILE).write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     except Exception as e:
@@ -89,7 +96,7 @@ def run_subprocess(cmd, timeout=None):
         log_error(f"[Subprocess Exception] {' '.join(cmd)}: {e}")
         return False
 
-def find_executable(cmd_name, fallbacks=None):
+def find_executable(cmd_name: str, fallbacks=None):
     exe = shutil.which(cmd_name)
     if not exe and os.name == "nt":
         exe = shutil.which(cmd_name + ".exe")
@@ -102,7 +109,7 @@ def find_executable(cmd_name, fallbacks=None):
     return None
 
 # ---------- ffprobe / ffmpeg helpers ----------
-def ffprobe_get_audio_channel_counts(ffprobe_cmd, file_path):
+def ffprobe_get_audio_channel_counts(ffprobe_cmd: str, file_path: Path):
     try:
         cmd = [
             ffprobe_cmd, "-v", "error",
@@ -126,10 +133,10 @@ def ffprobe_get_audio_channel_counts(ffprobe_cmd, file_path):
         log_error(f"[ffprobe error] {file_path}: {e}")
         return []
 
-def has_stereo_track(ffprobe_cmd, file_path):
+def has_stereo_track(ffprobe_cmd: str, file_path: Path):
     return 2 in ffprobe_get_audio_channel_counts(ffprobe_cmd, file_path)
 
-def ffprobe_get_duration(ffprobe_cmd, file_path):
+def ffprobe_get_duration(ffprobe_cmd: str, file_path: Path):
     try:
         cmd = [ffprobe_cmd, "-v", "error", "-show_entries", "format=duration",
                "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)]
@@ -143,14 +150,14 @@ def ffprobe_get_duration(ffprobe_cmd, file_path):
         return None
 
 _re_time = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
-def parse_ffmpeg_time(line):
+def parse_ffmpeg_time(line: str):
     m = _re_time.search(line)
     if not m:
         return None
     hh, mm, ss, centi = map(int, m.groups())
     return hh * 3600 + mm * 60 + ss + centi / 100.0
 
-def downmix_to_stereo_with_progress(ffmpeg_cmd, input_path: Path, output_path: Path, threads: int, bitrate: str, total_seconds: float, progress_callback):
+def downmix_to_stereo_with_progress(ffmpeg_cmd: str, input_path: Path, output_path: Path, threads: int, bitrate: str, total_seconds: float, progress_callback: Callable[[float], None]):
     cmd = [
         ffmpeg_cmd, "-y",
         "-threads", str(threads),
@@ -192,7 +199,11 @@ def downmix_to_stereo_with_progress(ffmpeg_cmd, input_path: Path, output_path: P
             pass
         return False
 
-def mux_stereo(mkvmerge_cmd, original_file: Path, stereo_aac: Path, output_file: Path, set_default_stereo=True):
+def mux_stereo_with_progress(mkvmerge_cmd: str, original_file: Path, stereo_aac: Path, output_file: Path, progress_callback: Callable[[float], None], poll_interval: float = 0.5, set_default_stereo: bool = True) -> bool:
+    """
+    Run mkvmerge and estimate progress by polling output file size vs expected size.
+    Falls back to a running indicator if sizes unavailable.
+    """
     cmd = [
         mkvmerge_cmd,
         "-o", str(output_file),
@@ -203,10 +214,57 @@ def mux_stereo(mkvmerge_cmd, original_file: Path, stereo_aac: Path, output_file:
     ]
     if set_default_stereo:
         cmd += ["--default-track", "1:yes"]
-    return run_subprocess(cmd)
+
+    try:
+        orig_size = original_file.stat().st_size
+    except Exception:
+        orig_size = 0
+    try:
+        stereo_size = stereo_aac.stat().st_size
+    except Exception:
+        stereo_size = 0
+    expected = orig_size + stereo_size
+    use_size_estimate = expected > 1024
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log_error(f"[mkvmerge launch error] {' '.join(cmd)}: {e}")
+        return False
+
+    last_report = 0.0
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            if output_file.exists() and use_size_estimate:
+                try:
+                    cur = output_file.stat().st_size
+                    pct = min(100.0, max(0.0, (cur / expected) * 100.0))
+                except Exception:
+                    pct = last_report
+            else:
+                pct = min(99.0, last_report + 1.0)
+            if pct - last_report >= 0.5:
+                last_report = pct
+                progress_callback(pct)
+            time.sleep(poll_interval)
+        proc.wait()
+        if output_file.exists():
+            progress_callback(100.0)
+            return proc.returncode == 0
+        else:
+            return False
+    except Exception as e:
+        log_error(f"[mkvmerge progress error] {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return False
 
 # ---------- PROCESSING ----------
-def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_state):
+def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_state: dict):
     ffmpeg_cmd, ffprobe_cmd, mkvmerge_cmd = tools
     queue.put(("log", f"Processing: {file_path.name}"))
     if has_stereo_track(ffprobe_cmd, file_path):
@@ -223,7 +281,7 @@ def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_
     queue.put(("status", f"Downmixing {file_path.name}"))
     start = time.time()
 
-    def cb(pct):
+    def ff_cb(pct):
         queue.put(("file_progress", pct))
 
     ok = downmix_to_stereo_with_progress(
@@ -231,7 +289,7 @@ def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_
         threads=cfg.get("ffmpeg_threads", DEFAULT_THREADS),
         bitrate=cfg.get("stereo_bitrate", DEFAULT_STEREO_BITRATE),
         total_seconds=dur,
-        progress_callback=cb
+        progress_callback=ff_cb
     )
     queue.put(("file_progress", 100.0))
     elapsed = time.time() - start
@@ -251,7 +309,11 @@ def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_
         return
 
     queue.put(("status", f"Muxing {file_path.name}"))
-    ok = mux_stereo(mkvmerge_cmd, file_path, stereo_path, output_path, set_default_stereo=True)
+
+    def mux_cb(pct):
+        queue.put(("file_progress", pct))
+
+    ok = mux_stereo_with_progress(mkvmerge_cmd, file_path, stereo_path, output_path, progress_callback=mux_cb, poll_interval=0.5, set_default_stereo=True)
     if not ok or not output_path.exists():
         queue.put(("error", f"Mux failed: {file_path.name}"))
         try:
@@ -311,22 +373,18 @@ def folder_worker_with_selection(folder: Path, selections: list, queue: Queue, c
     }
 
     processed = 0
-    # processed_files and current_file_pct are used by ETA calculation in GUI poll
     for p in selections:
         if stop_event.is_set():
             queue.put(("info", "Processing stopped by user"))
             break
 
-        # reset per-file progress to 0 before starting
         queue.put(("file_progress", 0.0))
         process_single_file(p, queue, cfg, tools, timing_state)
         processed += 1
         queue.put(("overall_progress", processed))
 
-        # compute remaining media seconds
         remaining_media_seconds = max(0.0, timing_state['total_media_seconds'] - timing_state['processed_media_seconds'])
 
-        # compute ETA using processed_media vs processing_seconds when available
         if timing_state['processed_media_seconds'] > 0 and timing_state['processing_seconds'] > 0:
             rate = timing_state['processing_seconds'] / timing_state['processed_media_seconds']
             eta_seconds = rate * remaining_media_seconds
@@ -355,7 +413,7 @@ class ScrollableCheckboxList(ttk.Frame):
         for it in items:
             self.add_item(it)
 
-    def add_item(self, text):
+    def add_item(self, text: str):
         var = tk.BooleanVar(value=False)
         cb = ttk.Checkbutton(self.frame, text=text, variable=var)
         cb.pack(anchor="w", padx=2, pady=1)
@@ -378,7 +436,7 @@ class StereoInjectorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Downmix Remuxer — Select Files")
-        self.root.geometry("920x680")
+        self.root.geometry("940x700")
         self.cfg = load_config()
 
         # resolve tools
@@ -423,6 +481,10 @@ class StereoInjectorApp:
                 self.custom_bitrate_entry.grid_forget()
                 self.custom_bitrate_var.set(sel)
         self.bitrate_combo.bind("<<ComboboxSelected>>", on_bitrate_change)
+
+        # Include subfolders option
+        self.scan_subfolders_var = tk.BooleanVar(value=self.cfg.get("scan_subfolders", True))
+        ttk.Checkbutton(options, text="Include subfolders in scan", variable=self.scan_subfolders_var).grid(row=0, column=6, sticky="w", padx=(10,0))
 
         # File checklist area
         list_frame = ttk.LabelFrame(root, text="Files without stereo (select to process)")
@@ -490,7 +552,7 @@ class StereoInjectorApp:
         else:
             self.append_log(f"Resolved executables: ffmpeg={self.ffmpeg_res}, ffprobe={self.ffprobe_res}, mkvmerge={self.mkvmerge_res}")
 
-    def append_log(self, msg, tag=None):
+    def append_log(self, msg: str, tag=None):
         self.log_text.configure(state="normal")
         self.log_text.insert("end", msg + "\n", (tag if tag else ""))
         self.log_text.see("end")
@@ -511,10 +573,19 @@ class StereoInjectorApp:
             messagebox.showerror("Folder Error", "Selected folder is not valid.")
             return
 
+        # persist scan_subfolders preference
+        self.cfg['scan_subfolders'] = bool(self.scan_subfolders_var.get())
+        save_config(self.cfg)
+
         self.checklist.clear()
         self.durations_map = {}
-        self.append_log(f"Scanning folder: {folder_path}")
-        candidates = sorted([p for p in folder_path.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS and p.is_file()])
+        self.append_log(f"Scanning folder: {folder_path} (recursive={self.scan_subfolders_var.get()})")
+
+        if self.scan_subfolders_var.get():
+            candidates = sorted([p for p in folder_path.rglob("*") if p.suffix.lower() in VIDEO_EXTENSIONS and p.is_file()])
+        else:
+            candidates = sorted([p for p in folder_path.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS and p.is_file()])
+
         missing_stereo = []
         for p in candidates:
             try:
@@ -574,7 +645,8 @@ class StereoInjectorApp:
         self.cfg = {
             "delete_original_after_mux": bool(self.delete_var.get()),
             "ffmpeg_threads": int(self.threads_var.get()),
-            "stereo_bitrate": bitrate
+            "stereo_bitrate": bitrate,
+            "scan_subfolders": bool(self.scan_subfolders_var.get())
         }
         save_config(self.cfg)
 
@@ -610,7 +682,6 @@ class StereoInjectorApp:
             self.stop_btn.config(state="disabled")
 
     def compute_eta_from_elapsed(self):
-        # overall_fraction = (processed_files + current_file_pct/100) / total_files
         if not self.process_start_time or self.total_files <= 0:
             return None
         elapsed = time.time() - self.process_start_time
@@ -657,14 +728,12 @@ class StereoInjectorApp:
                     else:
                         self.eta_label.config(text="ETA: calculating...")
                 elif typ == "eta_update":
-                    # backward compatibility: ignore in favour of elapsed-based ETA
+                    # kept for compatibility; ignored in favour of elapsed-based ETA
                     pass
                 elif typ == "done":
                     self.append_log(f"Done: {msg}")
-                    # processed_files increment handled by overall_progress messages
                 elif typ == "skip":
                     self.append_log(f"Skipped (stereo exists): {msg}", "skip")
-                    # treat skip as processed
                     self.processed_files += 1
                     self.overall_progress['value'] = self.processed_files
                     self.overall_progress_label.config(text=f"{self.processed_files}/{self.total_files}")
