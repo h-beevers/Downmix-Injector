@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-Stereo Track Injector GUI — selectable scan list + ETA
-Features added:
-- Browse folder then "Scan" to list video files that lack a stereo (2-channel) audio track
-- Scrollable checklist of those filenames with individual checkboxes and a Select All / Deselect All
-- Start processing only selected files
-- Per-file progress bar and overall progress bar
-- Dynamic estimated time remaining that updates as files complete (estimation based on file durations and measured processing time)
+Downmix Remuxer — selectable scan list + ETA (elapsed-time based)
+ETA now uses: elapsed_time_so_far / overall_progress_fraction * (1 - overall_progress_fraction)
+so it updates immediately from the observed runtime and current progress percentage.
 Requirements:
 - Python 3.7+
-- ffmpeg, ffprobe, mkvmerge in PATH or configured in COMMON_FALLBACKS
+- ffmpeg, ffprobe, mkvmerge in PATH or set COMMON_FALLBACKS
 """
 import os
 import json
@@ -105,7 +101,7 @@ def find_executable(cmd_name, fallbacks=None):
                 return p
     return None
 
-# ---------- ffprobe helpers ----------
+# ---------- ffprobe / ffmpeg helpers ----------
 def ffprobe_get_audio_channel_counts(ffprobe_cmd, file_path):
     try:
         cmd = [
@@ -135,7 +131,8 @@ def has_stereo_track(ffprobe_cmd, file_path):
 
 def ffprobe_get_duration(ffprobe_cmd, file_path):
     try:
-        cmd = [ffprobe_cmd, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)]
+        cmd = [ffprobe_cmd, "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             return None
@@ -145,7 +142,6 @@ def ffprobe_get_duration(ffprobe_cmd, file_path):
         log_error(f"[ffprobe duration error] {file_path}: {e}")
         return None
 
-# ---------- ffmpeg progress parsing ----------
 _re_time = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
 def parse_ffmpeg_time(line):
     m = _re_time.search(line)
@@ -170,7 +166,6 @@ def downmix_to_stereo_with_progress(ffmpeg_cmd, input_path: Path, output_path: P
     except Exception as e:
         log_error(f"[ffmpeg launch error] {' '.join(cmd)}: {e}")
         return False
-
     try:
         last_pct = 0.0
         while True:
@@ -210,7 +205,7 @@ def mux_stereo(mkvmerge_cmd, original_file: Path, stereo_aac: Path, output_file:
         cmd += ["--default-track", "1:yes"]
     return run_subprocess(cmd)
 
-# ---------- WORKER & ETA logic ----------
+# ---------- PROCESSING ----------
 def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_state):
     ffmpeg_cmd, ffprobe_cmd, mkvmerge_cmd = tools
     queue.put(("log", f"Processing: {file_path.name}"))
@@ -221,8 +216,9 @@ def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_
     stereo_path = file_path.with_name(f"{file_path.stem}_stereo.aac")
     output_path = file_path.with_name(f"{file_path.stem}_with_stereo.mkv")
 
-    # estimate duration from ffprobe; fallback to 0
-    dur = ffprobe_get_duration(ffprobe_cmd, file_path) or 0.0
+    dur = timing_state.get('durations_map', {}).get(str(file_path), None)
+    if dur is None:
+        dur = ffprobe_get_duration(ffprobe_cmd, file_path) or 0.0
 
     queue.put(("status", f"Downmixing {file_path.name}"))
     start = time.time()
@@ -230,19 +226,20 @@ def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_
     def cb(pct):
         queue.put(("file_progress", pct))
 
-    ok = downmix_to_stereo_with_progress(ffmpeg_cmd, file_path, stereo_path, threads=cfg.get("ffmpeg_threads", DEFAULT_THREADS), bitrate=cfg.get("stereo_bitrate", DEFAULT_STEREO_BITRATE), total_seconds=dur, progress_callback=cb)
+    ok = downmix_to_stereo_with_progress(
+        ffmpeg_cmd, file_path, stereo_path,
+        threads=cfg.get("ffmpeg_threads", DEFAULT_THREADS),
+        bitrate=cfg.get("stereo_bitrate", DEFAULT_STEREO_BITRATE),
+        total_seconds=dur,
+        progress_callback=cb
+    )
     queue.put(("file_progress", 100.0))
     elapsed = time.time() - start
 
-    # update timing state for ETA calculations
-    if dur > 0:
-        # keep accumulated totals
-        timing_state['processed_duration'] += dur
-        timing_state['processing_time'] += elapsed
-    else:
-        # if duration unknown, count as a nominal 60s of duration for estimation weighting
-        timing_state['processed_duration'] += 60.0
-        timing_state['processing_time'] += elapsed
+    media_seconds = dur if dur and dur > 0 else timing_state.get('nominal_sec_per_unknown', 60.0)
+    timing_state['processed_media_seconds'] += media_seconds
+    timing_state['processing_seconds'] += elapsed
+    timing_state['files_done'] += 1
 
     if not ok or not stereo_path.exists():
         queue.put(("error", f"Downmix failed: {file_path.name}"))
@@ -264,7 +261,6 @@ def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_
             pass
         return
 
-    # cleanup
     try:
         if stereo_path.exists():
             stereo_path.unlink()
@@ -280,31 +276,66 @@ def process_single_file(file_path: Path, queue: Queue, cfg: dict, tools, timing_
 
     queue.put(("done", output_path.name))
 
-def folder_worker_with_selection(folder: Path, selections: list, queue: Queue, cfg: dict, stop_event: threading.Event, tools):
-    # selections: list of Path objects to process in order
+def folder_worker_with_selection(folder: Path, selections: list, queue: Queue, cfg: dict, stop_event: threading.Event, tools, precomputed_durations_map=None):
     total = len(selections)
     queue.put(("info", f"Scheduled {total} files for processing"))
     queue.put(("total_files", total))
-    timing_state = {'processed_duration': 0.0, 'processing_time': 0.0}
+
+    durations_map = precomputed_durations_map.copy() if precomputed_durations_map else {}
+    for p in selections:
+        if stop_event.is_set():
+            queue.put(("info", "Processing stopped by user"))
+            return
+        if str(p) not in durations_map:
+            try:
+                d = ffprobe_get_duration(tools[1], p) or 0.0
+                durations_map[str(p)] = d
+            except Exception as e:
+                durations_map[str(p)] = 0.0
+                log_error(f"[duration scan error] {p}: {e}")
+
+    nominal = 60.0
+    total_media_seconds = sum(d for d in durations_map.values() if d and d > 0)
+    unknown_count = sum(1 for p in selections if not durations_map.get(str(p)))
+    if total_media_seconds == 0.0 and unknown_count > 0:
+        total_media_seconds = unknown_count * nominal
+
+    timing_state = {
+        'durations_map': durations_map,
+        'total_media_seconds': total_media_seconds,
+        'processed_media_seconds': 0.0,
+        'processing_seconds': 0.0,
+        'files_done': 0,
+        'nominal_sec_per_unknown': nominal,
+        'start_time': time.time()
+    }
+
     processed = 0
+    # processed_files and current_file_pct are used by ETA calculation in GUI poll
     for p in selections:
         if stop_event.is_set():
             queue.put(("info", "Processing stopped by user"))
             break
+
+        # reset per-file progress to 0 before starting
+        queue.put(("file_progress", 0.0))
         process_single_file(p, queue, cfg, tools, timing_state)
         processed += 1
         queue.put(("overall_progress", processed))
-        # compute ETA after each file
-        remaining = sum((ffprobe_get_duration(tools[1], q) or 0.0) for q in selections[processed:])
-        # if we have processed_duration and processing_time, derive factor = seconds processing per input-second
-        if timing_state['processed_duration'] > 0 and timing_state['processing_time'] > 0:
-            factor = timing_state['processing_time'] / timing_state['processed_duration']
-            eta_seconds = factor * remaining
+
+        # compute remaining media seconds
+        remaining_media_seconds = max(0.0, timing_state['total_media_seconds'] - timing_state['processed_media_seconds'])
+
+        # compute ETA using processed_media vs processing_seconds when available
+        if timing_state['processed_media_seconds'] > 0 and timing_state['processing_seconds'] > 0:
+            rate = timing_state['processing_seconds'] / timing_state['processed_media_seconds']
+            eta_seconds = rate * remaining_media_seconds
         else:
-            # fallback: use average per-file elapsed if available, else estimate 30s per remaining-second-of-video
-            avg_elapsed = (timing_state['processing_time'] / processed) if processed > 0 else 10.0
-            eta_seconds = avg_elapsed * (len(selections) - processed)
+            avg_elapsed_per_file = (timing_state['processing_seconds'] / max(1, timing_state['files_done'])) if timing_state['files_done'] > 0 else 10.0
+            eta_seconds = avg_elapsed_per_file * (total - processed)
+
         queue.put(("eta_update", eta_seconds))
+
     queue.put(("finished", "All done"))
 
 # ---------- GUI ----------
@@ -346,8 +377,8 @@ class ScrollableCheckboxList(ttk.Frame):
 class StereoInjectorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Stereo Track Injector — Select Files")
-        self.root.geometry("900x640")
+        self.root.title("Downmix Remuxer — Select Files")
+        self.root.geometry("920x680")
         self.cfg = load_config()
 
         # resolve tools
@@ -356,10 +387,13 @@ class StereoInjectorApp:
         self.mkvmerge_res = find_executable("mkvmerge", COMMON_FALLBACKS.get("mkvmerge"))
         self.tools = (self.ffmpeg_res, self.ffprobe_res, self.mkvmerge_res)
 
+        # durations_map stores durations from last scan/refresh (keyed by full path string)
+        self.durations_map = {}
+
         top = ttk.Frame(root); top.pack(fill="x", padx=10, pady=8)
         ttk.Label(top, text="Folder:").grid(row=0, column=0, sticky="w")
         self.folder_var = tk.StringVar()
-        self.folder_entry = ttk.Entry(top, textvariable=self.folder_var, width=80); self.folder_entry.grid(row=1, column=0, sticky="w")
+        self.folder_entry = ttk.Entry(top, textvariable=self.folder_var, width=86); self.folder_entry.grid(row=1, column=0, sticky="w")
         ttk.Button(top, text="Browse", command=self.browse_folder).grid(row=1, column=1, sticky="e")
         ttk.Button(top, text="Scan for files without stereo", command=self.scan_folder).grid(row=1, column=2, padx=(8,0))
 
@@ -409,11 +443,11 @@ class StereoInjectorApp:
         # Progress
         prog_frame = ttk.Frame(root); prog_frame.pack(fill="x", padx=10, pady=(0,8))
         ttk.Label(prog_frame, text="Current file:").grid(row=0, column=0, sticky="w")
-        self.file_progress = ttk.Progressbar(prog_frame, orient="horizontal", length=520, mode="determinate")
+        self.file_progress = ttk.Progressbar(prog_frame, orient="horizontal", length=560, mode="determinate")
         self.file_progress.grid(row=0, column=1, padx=(6,0), sticky="w")
         self.file_progress_label = ttk.Label(prog_frame, text="0%"); self.file_progress_label.grid(row=0, column=2, padx=(8,0))
         ttk.Label(prog_frame, text="Overall:").grid(row=1, column=0, sticky="w", pady=(6,0))
-        self.overall_progress = ttk.Progressbar(prog_frame, orient="horizontal", length=520, mode="determinate")
+        self.overall_progress = ttk.Progressbar(prog_frame, orient="horizontal", length=560, mode="determinate")
         self.overall_progress.grid(row=1, column=1, padx=(6,0), sticky="w", pady=(6,0))
         self.overall_progress_label = ttk.Label(prog_frame, text="0/0"); self.overall_progress_label.grid(row=1, column=2, padx=(8,0), pady=(6,0))
         self.eta_label = ttk.Label(prog_frame, text="ETA: N/A"); self.eta_label.grid(row=2, column=1, sticky="w", pady=(6,0))
@@ -433,7 +467,10 @@ class StereoInjectorApp:
         self.stop_event = threading.Event()
         self.total_files = 0
         self.processed_files = 0
+        self.current_file_pct = 0.0
+        self.process_start_time = None
 
+        # periodic poll
         self.root.after(200, self.poll_queue)
         self.preflight()
 
@@ -473,10 +510,10 @@ class StereoInjectorApp:
         if not folder_path.exists() or not folder_path.is_dir():
             messagebox.showerror("Folder Error", "Selected folder is not valid.")
             return
-        # clear existing
+
         self.checklist.clear()
+        self.durations_map = {}
         self.append_log(f"Scanning folder: {folder_path}")
-        # scan files
         candidates = sorted([p for p in folder_path.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS and p.is_file()])
         missing_stereo = []
         for p in candidates:
@@ -485,37 +522,55 @@ class StereoInjectorApp:
                     missing_stereo.append(p)
             except Exception as e:
                 log_error(f"[scan error] {p}: {e}")
+
         if not missing_stereo:
             self.append_log("No files without stereo found.")
             return
-        # populate checklist with file paths (display filename)
+
         for p in missing_stereo:
             self.checklist.add_item(str(p))
-        # auto-select all by default
+            try:
+                d = ffprobe_get_duration(self.ffprobe_res, p) or 0.0
+                if d and d > 0:
+                    self.durations_map[str(p)] = d
+            except Exception:
+                pass
+
         self.checklist.set_all(True)
         self.append_log(f"Found {len(missing_stereo)} files without stereo; selected all by default.")
+        if any(not self.durations_map.get(str(p)) for p in missing_stereo):
+            self.append_log("Note: some files lack duration metadata. Use 'Refresh durations' for better ETA.")
 
     def refresh_selected_durations(self):
-        # placeholder that triggers recalculation of ETA next time processing starts
         checked = self.checklist.get_checked()
         if not checked:
             messagebox.showinfo("No selection", "No files selected.")
             return
-        self.append_log("Refreshed selected file list; durations will be gathered at processing time.")
+        self.append_log("Refreshing durations for selected files...")
+        for s in checked:
+            p = Path(s)
+            try:
+                d = ffprobe_get_duration(self.ffprobe_res, p) or 0.0
+                self.durations_map[str(p)] = d
+                self.append_log(f"Duration: {p.name} -> {format_seconds(d) if d else 'unknown'}")
+            except Exception as e:
+                log_error(f"[refresh duration error] {p}: {e}")
+                self.append_log(f"Duration: {p.name} -> unknown", "error")
+        self.append_log("Durations refreshed. ETA will use updated values when processing starts.")
 
     def start_processing(self):
         checked = self.checklist.get_checked()
         if not checked:
             messagebox.showwarning("Select Files", "No files selected to process.")
             return
-        # convert to Path list
         selections = [Path(s) for s in checked]
-        # prepare cfg
+
         selected_preset = self.bitrate_combo.get()
         if selected_preset == "Custom...":
             bitrate = self.custom_bitrate_var.get().strip() or DEFAULT_STEREO_BITRATE
         else:
             bitrate = selected_preset or DEFAULT_STEREO_BITRATE
+
         self.cfg = {
             "delete_original_after_mux": bool(self.delete_var.get()),
             "ffmpeg_threads": int(self.threads_var.get()),
@@ -523,15 +578,16 @@ class StereoInjectorApp:
         }
         save_config(self.cfg)
 
-        # UI state
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.status_label.config(text="Running")
         self.append_log(f"Starting processing of {len(selections)} files")
 
-        # reset progress and ETA
         self.total_files = len(selections)
         self.processed_files = 0
+        self.current_file_pct = 0.0
+        self.process_start_time = time.time()
+
         self.overall_progress['maximum'] = max(1, self.total_files)
         self.overall_progress['value'] = 0
         self.overall_progress_label.config(text=f"0/{self.total_files}")
@@ -539,9 +595,12 @@ class StereoInjectorApp:
         self.file_progress_label.config(text="0%")
         self.eta_label.config(text="ETA: calculating...")
 
-        # start thread
         self.stop_event.clear()
-        self.worker_thread = threading.Thread(target=folder_worker_with_selection, args=(Path(self.folder_var.get()), selections, self.queue, self.cfg, self.stop_event, self.tools), daemon=True)
+        self.worker_thread = threading.Thread(
+            target=folder_worker_with_selection,
+            args=(Path(self.folder_var.get()), selections, self.queue, self.cfg, self.stop_event, self.tools, self.durations_map),
+            daemon=True
+        )
         self.worker_thread.start()
 
     def stop_processing(self):
@@ -549,6 +608,19 @@ class StereoInjectorApp:
             self.stop_event.set()
             self.append_log("Stop requested; current file will finish then stop.")
             self.stop_btn.config(state="disabled")
+
+    def compute_eta_from_elapsed(self):
+        # overall_fraction = (processed_files + current_file_pct/100) / total_files
+        if not self.process_start_time or self.total_files <= 0:
+            return None
+        elapsed = time.time() - self.process_start_time
+        overall_done = self.processed_files + (self.current_file_pct / 100.0)
+        overall_frac = overall_done / self.total_files
+        if overall_frac <= 0.0:
+            return None
+        remaining_factor = (1.0 / overall_frac) - 1.0
+        eta_seconds = elapsed * remaining_factor
+        return eta_seconds
 
     def poll_queue(self):
         try:
@@ -559,38 +631,54 @@ class StereoInjectorApp:
                 typ, msg = item[0], item[1]
                 if typ == "info":
                     self.append_log(msg)
-                elif typ == "total_files":
-                    # handled in start_processing
-                    pass
                 elif typ == "status":
                     self.append_log(msg)
                     self.status_label.config(text=msg)
                     self.file_progress['value'] = 0
                     self.file_progress_label.config(text="0%")
+                    self.current_file_pct = 0.0
                 elif typ == "file_progress":
                     pct = float(msg)
                     self.file_progress['value'] = pct
                     self.file_progress_label.config(text=f"{pct:.0f}%")
+                    self.current_file_pct = pct
+                    eta = self.compute_eta_from_elapsed()
+                    if eta is not None:
+                        self.eta_label.config(text=f"ETA: {format_seconds(eta)}")
+                    else:
+                        self.eta_label.config(text="ETA: calculating...")
                 elif typ == "overall_progress":
                     self.processed_files = int(msg)
                     self.overall_progress['value'] = self.processed_files
                     self.overall_progress_label.config(text=f"{self.processed_files}/{self.total_files}")
+                    eta = self.compute_eta_from_elapsed()
+                    if eta is not None:
+                        self.eta_label.config(text=f"ETA: {format_seconds(eta)}")
+                    else:
+                        self.eta_label.config(text="ETA: calculating...")
                 elif typ == "eta_update":
-                    eta_seconds = float(msg)
-                    self.eta_label.config(text=f"ETA: {format_seconds(eta_seconds)}")
+                    # backward compatibility: ignore in favour of elapsed-based ETA
+                    pass
                 elif typ == "done":
                     self.append_log(f"Done: {msg}")
+                    # processed_files increment handled by overall_progress messages
                 elif typ == "skip":
                     self.append_log(f"Skipped (stereo exists): {msg}", "skip")
+                    # treat skip as processed
                     self.processed_files += 1
                     self.overall_progress['value'] = self.processed_files
                     self.overall_progress_label.config(text=f"{self.processed_files}/{self.total_files}")
+                    eta = self.compute_eta_from_elapsed()
+                    if eta is not None:
+                        self.eta_label.config(text=f"ETA: {format_seconds(eta)}")
                 elif typ == "error":
                     self.append_log(msg, "error")
-                    # count as processed to avoid stalling overall progress
                     self.processed_files += 1
                     self.overall_progress['value'] = self.processed_files
                     self.overall_progress_label.config(text=f"{self.processed_files}/{self.total_files}")
+                    eta = self.compute_eta_from_elapsed()
+                    if eta is not None:
+                        self.eta_label.config(text=f"ETA: {format_seconds(eta)}")
                 elif typ == "log":
                     self.append_log(msg)
                 elif typ == "finished":
@@ -611,7 +699,10 @@ class StereoInjectorApp:
 def format_seconds(s):
     if s is None:
         return "N/A"
-    s = int(round(s))
+    try:
+        s = int(round(s))
+    except Exception:
+        return "N/A"
     if s < 60:
         return f"{s}s"
     m, sec = divmod(s, 60)
